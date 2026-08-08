@@ -39,8 +39,9 @@ use crate::{
     object_bridge::MontyObjectExt,
     os_dispatch::{PendingOsEffect, listdir_names},
     parse::CodeRange,
+    registered::{ModuleCacheSlot, REGISTERED_MODULE_IMPORT, REGISTERED_MODULE_MAKE, RegisteredModule},
     types::{
-        Dict, LongInt, PyTrait,
+        Dict, LongInt, Module, PyTrait,
         file::{apply_buffer_store, apply_write_position},
     },
     value::{EitherStr, Value},
@@ -624,6 +625,12 @@ pub struct VMSnapshot {
     /// [`VM::pending_os_effect`].
     #[serde(default)]
     pending_os_effect: Option<PendingOsEffect>,
+
+    /// Registered-module cache slots (one per registry entry; empty when the
+    /// program registered none). Serialized so a run suspended mid-import
+    /// resumes with already-executed modules still cached.
+    #[serde(default)]
+    module_cache: Vec<ModuleCacheSlot>,
 }
 
 // ============================================================================
@@ -747,6 +754,17 @@ pub struct VM<'h> {
     /// UTF-8 byte cap for each operand repr in introspected assert messages.
     /// Supplied by the executor on construction, so it is not snapshotted.
     pub(crate) assert_repr_max_bytes: u32,
+
+    /// The executor's registered source modules, in registry order. Empty for
+    /// programs that registered none (including every conversion-utility VM).
+    /// Installed by [`Self::set_registered`] on the execution paths; the
+    /// `RegisteredModule` opcode is unreachable without it.
+    registered: &'h [RegisteredModule],
+
+    /// Per-run cache of materialized registered-module objects, parallel to
+    /// [`Self::registered`]. Each `Ready` slot holds one strong reference,
+    /// dropped with the VM (or carried by the snapshot).
+    module_cache: Vec<ModuleCacheSlot>,
 }
 
 impl<'h> VM<'h> {
@@ -777,6 +795,22 @@ impl<'h> VM<'h> {
             run_reentry_depth: recursion::MAX_RUN_REENTRY_DEPTH,
             re_pattern_cache: RePatternCache::default(),
             assert_repr_max_bytes,
+            registered: &[],
+            module_cache: Vec::new(),
+        }
+    }
+
+    /// Installs the executor's registered source modules for this run.
+    ///
+    /// Called on the execution paths before any bytecode runs; conversion
+    /// utility VMs never call it, which is sound because only compiled
+    /// `RegisteredModule` opcodes reach the registry. Preserves an existing
+    /// cache of matching length so a snapshot-restored VM keeps its
+    /// already-executed modules.
+    pub(crate) fn set_registered(&mut self, registered: &'h [RegisteredModule]) {
+        self.registered = registered;
+        if self.module_cache.len() != registered.len() {
+            self.module_cache = (0..registered.len()).map(|_| ModuleCacheSlot::Absent).collect();
         }
     }
 
@@ -849,6 +883,10 @@ impl<'h> VM<'h> {
             run_reentry_depth: recursion::MAX_RUN_REENTRY_DEPTH,
             re_pattern_cache: RePatternCache::default(),
             assert_repr_max_bytes,
+            // The caller's `set_registered` reinstalls the registry; the
+            // restored cache is preserved because its length matches.
+            registered: &[],
+            module_cache: snapshot.module_cache,
         }
     }
 
@@ -883,6 +921,7 @@ impl<'h> VM<'h> {
             instruction_ip: self.instruction_ip,
             scheduler: mem::take(&mut self.scheduler),
             pending_os_effect: self.pending_os_effect.take(),
+            module_cache: mem::take(&mut self.module_cache),
         }
     }
 
@@ -1727,6 +1766,13 @@ impl<'h> VM<'h> {
                     let module_id = cached_frame.fetch_u8();
                     try_catch_sync!(self, cached_frame, self.load_module(module_id));
                 }
+                Opcode::RegisteredModule => {
+                    let (action, index) = cached_frame.fetch_u16_u16();
+                    // Sync IP before a potential body call: the pushed frame
+                    // records the call site for tracebacks.
+                    self.current_frame_mut().ip = cached_frame.ip;
+                    handle_call_result!(self, cached_frame, self.registered_module_op(action, index));
+                }
                 Opcode::RaiseImportError => {
                     // Fetch the module name from the constant pool and raise ModuleNotFoundError
                     let const_idx = cached_frame.fetch_u16();
@@ -1765,6 +1811,61 @@ impl<'h> VM<'h> {
         let heap_id = module.create(self)?;
         self.push(Value::Ref(heap_id));
         Ok(())
+    }
+
+    /// Executes the `RegisteredModule` opcode.
+    ///
+    /// The import action pushes the cached module object, or on first import
+    /// invokes the module body as a zero-arg call — the body's make tail then
+    /// returns the module object to this import site through the ordinary
+    /// call protocol. The make action builds the module object from the
+    /// module's completed globals range and caches one strong reference.
+    fn registered_module_op(&mut self, action: u16, index: u16) -> Result<CallResult, RunError> {
+        // Copy the slice reference out of `self`: it borrows the executor
+        // (`'h`), not this VM, so it stays usable across `&mut self` calls.
+        let registered = self.registered;
+        let module_meta = registered
+            .get(usize::from(index))
+            .expect("RegisteredModule operand beyond registry — executor not installed via set_registered");
+        match action {
+            REGISTERED_MODULE_IMPORT => match &self.module_cache[usize::from(index)] {
+                ModuleCacheSlot::Ready(value) => {
+                    let value = value.clone_with_heap(self.heap);
+                    Ok(CallResult::Value(value))
+                }
+                // Construction refuses import cycles among registered
+                // modules, so an in-flight body can never be re-imported.
+                ModuleCacheSlot::InProgress => {
+                    unreachable!("registered-module import cycle — refused at construction")
+                }
+                ModuleCacheSlot::Absent => {
+                    self.module_cache[usize::from(index)] = ModuleCacheSlot::InProgress;
+                    self.call_sync_function(module_meta.function_id, &[], &[], ArgValues::Empty)
+                }
+            },
+            REGISTERED_MODULE_MAKE => {
+                let mut module = Module::new(module_meta.name_id);
+                let base = usize::from(module_meta.globals_base);
+                for (slot, name_id) in module_meta.name_map.iter() {
+                    let value = &self.globals[base + usize::from(slot.as_u16())];
+                    // A name the body never assigned (e.g. bound only on a
+                    // dead branch) is simply not a module attribute.
+                    if matches!(value, Value::Undefined) {
+                        continue;
+                    }
+                    let value = value.clone_with_heap(self.heap);
+                    module.set_attr(name_id, value, self);
+                }
+                let heap_id = self.heap.allocate(HeapData::Module(module))?;
+                // The allocation's reference goes to the push; the cache
+                // takes its own increment.
+                let value = Value::Ref(heap_id);
+                let cached = value.clone_with_heap(self.heap);
+                self.module_cache[usize::from(index)] = ModuleCacheSlot::Ready(cached);
+                Ok(CallResult::Value(value))
+            }
+            _ => unreachable!("unknown RegisteredModule action {action}"),
+        }
     }
 
     /// Resumes execution after an external call completes.
@@ -2334,5 +2435,10 @@ impl Drop for VM<'_> {
         self.scheduler.cleanup(self.heap);
         self.globals.drain(..).drop_with(self.heap);
         self.json_string_cache.drop_all(self.heap);
+        for slot in self.module_cache.drain(..) {
+            if let ModuleCacheSlot::Ready(value) = slot {
+                value.drop_with(self.heap);
+            }
+        }
     }
 }

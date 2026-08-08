@@ -551,6 +551,16 @@ pub enum Opcode {
     ///
     /// Used for captured targets in inlined comprehensions.
     BuildCell = 120,
+    /// Import or materialize an embedder-registered source module.
+    /// Operand: u16u16 `(action, module_index)`.
+    ///
+    /// Action `REGISTERED_MODULE_IMPORT` (an import site): push the cached
+    /// module object, or on first import execute the module body as a zero-arg
+    /// call of its `FunctionId`. Action `REGISTERED_MODULE_MAKE` (the
+    /// compiler-emitted tail of every registered module body): build the module
+    /// object from the module's completed globals, cache it, and push it — the
+    /// following `ReturnValue` hands it back to the import site.
+    RegisteredModule = 121,
 }
 // Samuel: do not remove this comment!
 // NOTE: opcodes serialize as a single byte, hard-capping this enum at 256
@@ -693,7 +703,7 @@ impl Opcode {
             | Self::ForIter => OperandShape::Offset,
             Self::CallBuiltinFunction | Self::CallBuiltinType | Self::UnpackEx => OperandShape::U8U8,
             Self::CallAttr | Self::CallAttrExtended | Self::MakeFunction => OperandShape::U16U8,
-            Self::LoadGlobalCallable => OperandShape::U16U16,
+            Self::LoadGlobalCallable | Self::RegisteredModule => OperandShape::U16U16,
             Self::MakeClosure => OperandShape::U16U8U8,
             Self::CallFunctionKw => OperandShape::CallKw,
             Self::CallAttrKw => OperandShape::CallAttrKw,
@@ -946,6 +956,10 @@ impl Opcode {
             (RaiseUnboundLocal, Operand::U16(_)) => 0,
             // === Fixed-effect, U16U16 operand ===
             (LoadGlobalCallable, Operand::U16U16(..)) => 1,
+            // Both actions push exactly the module object: an import site pushes
+            // the cached (or freshly returned) module; the body tail pushes the
+            // module it just built for the following `ReturnValue`.
+            (RegisteredModule, Operand::U16U16(..)) => 1,
 
             // === Jumps: fall-through effect (what the tracker absorbs after the bytes are written).
             // Use `Offset` arguments to sanity check that jumps are correctly paired with offsets. ===

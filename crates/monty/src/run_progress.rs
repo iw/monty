@@ -359,6 +359,7 @@ impl NameLookup {
                     print.reborrow(),
                     executor.assert_repr_max_bytes,
                 );
+                vm.set_registered(&executor.registered);
 
                 // Resolve the name lookup result with the VM alive
                 let vm_result = match result {
@@ -470,6 +471,7 @@ impl ResolveFutures {
                 PrintWriter::Stdout,
                 executor.assert_repr_max_bytes,
             );
+            vm.set_registered(&executor.registered);
             vm.__force_gc_for_tests();
             vm.snapshot()
         });
@@ -521,6 +523,7 @@ impl ResolveFutures {
                     print.reborrow(),
                     executor.assert_repr_max_bytes,
                 );
+                vm.set_registered(&executor.registered);
 
                 // Now check for invalid call_ids after VM is restored.
                 if let Some(call_id) = invalid_call_id {
@@ -584,6 +587,7 @@ impl Snapshot {
                     print.reborrow(),
                     executor.assert_repr_max_bytes,
                 );
+                vm.set_registered(&executor.registered);
 
                 let vm_result = match ext_result {
                     ExtFunctionResult::Return(obj) => vm.resume(obj),
@@ -799,7 +803,7 @@ pub(crate) fn build_run_progress(
             new_snapshot!(),
         ))),
         ConvertedExit::Error(err) => {
-            Err(err.into_python_exception(&executor.interns, |_| Some(executor.code.as_str())))
+            Err(err.into_python_exception(&executor.interns, |filename| executor.source_for(filename)))
         }
     }
 }

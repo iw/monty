@@ -852,7 +852,7 @@ impl VM<'_> {
     /// Locals are built in the reusable `namespace_scratch` buffer (under a
     /// [`DropGuard`] for cleanup on error) and moved onto the VM stack, where
     /// `stack_base` points to the start of the locals region.
-    fn call_sync_function(
+    pub(super) fn call_sync_function(
         &mut self,
         func_id: FunctionId,
         cells: &[HeapId],

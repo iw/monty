@@ -33,6 +33,7 @@ use crate::{
     name_map::NameMap,
     namespace::NamespaceId,
     parse::{CodeRange, ExceptHandler, Try},
+    registered::{ModuleRegistry, REGISTERED_MODULE_IMPORT, REGISTERED_MODULE_MAKE},
     run::CompileOptions,
     source_map::{SourceMap, StackFrameExt},
     value::{EitherStr, Value},
@@ -287,6 +288,25 @@ pub struct Compiler<'a> {
     /// Whether to compile pytest-style assert failure annotations.
     /// Propagated to nested function and class-body compilers.
     assert_message_annotations: bool,
+
+    /// Import-resolution registry for embedder-registered source modules, or
+    /// `None` when the program registered none. Consulted after the built-in
+    /// module lookup misses in `compile_import`/`compile_import_from`, so a
+    /// registered name can never shadow a built-in.
+    registry: Option<&'a ModuleRegistry>,
+
+    /// Offset of the enclosing module's slot range within the VM's flat
+    /// globals vector: `0` for the main program, the module's base for a
+    /// registered module. Baked into every global-slot operand this compiler
+    /// emits — including inside nested functions and class bodies — which is
+    /// what gives each registered module its own namespace at zero runtime
+    /// cost.
+    globals_base: u16,
+
+    /// Registry indexes imported by this compilation — the dependency edges
+    /// the construction-time import-cycle check consumes. Nested function and
+    /// class-body compilations merge theirs into the enclosing compiler's.
+    registered_imports: Vec<u16>,
 }
 
 /// Information about a loop for break/continue handling.
@@ -382,6 +402,21 @@ pub struct CompileResult {
     pub code: Code,
     /// All functions compiled during module compilation, indexed by their function ID.
     pub functions: Vec<Function>,
+    /// Registry indexes of every registered module this compilation imports,
+    /// anywhere in its body (including inside function and class bodies).
+    /// Empty when no registry was supplied. Consumed by the
+    /// construction-time import-cycle check.
+    pub registered_imports: Vec<u16>,
+}
+
+/// A compiled nested body (function, lambda, or class body): its code, the
+/// accumulated function table, and the registered-module imports found inside
+/// it — merged into the enclosing compiler so dependency edges survive
+/// nesting.
+struct CompiledBody {
+    code: Code,
+    functions: Vec<Function>,
+    registered_imports: Vec<u16>,
 }
 
 impl<'a> Compiler<'a> {
@@ -399,6 +434,8 @@ impl<'a> Compiler<'a> {
         is_module_scope: bool,
         frame_locals: u16,
         assert_message_annotations: bool,
+        registry: Option<&'a ModuleRegistry>,
+        globals_base: u16,
     ) -> Self {
         let mut code = CodeBuilder::new();
         code.new_code_region(0);
@@ -413,21 +450,10 @@ impl<'a> Compiler<'a> {
             frame_locals,
             comp_slots: Vec::new(),
             assert_message_annotations,
+            registry,
+            globals_base,
+            registered_imports: Vec::new(),
         }
-    }
-
-    /// Compiles module-level code (a sequence of statements).
-    ///
-    /// Returns the compiled module Code and all compiled Functions, or a compile
-    /// error if limits were exceeded. The module implicitly returns the value
-    /// of the last expression, or None if empty.
-    pub fn compile_module(
-        nodes: &[PreparedNode],
-        interns: &Interns,
-        globals: &NameMap,
-        options: CompileOptions,
-    ) -> Result<CompileResult, CompileError> {
-        Self::compile_module_with_functions(nodes, interns, globals, Vec::new(), options)
     }
 
     /// Compiles module-level code while preserving an existing function table prefix.
@@ -442,6 +468,23 @@ impl<'a> Compiler<'a> {
         existing_functions: Vec<Function>,
         options: CompileOptions,
     ) -> Result<CompileResult, CompileError> {
+        Self::compile_module_core(nodes, interns, globals, existing_functions, options, None, 0, None)
+    }
+
+    /// Shared core of every module-level compilation: the main program (no
+    /// registry, base `0`, plain tail) and registered module bodies (their
+    /// slot base, a `RegisteredModule` make tail).
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) fn compile_module_core(
+        nodes: &[PreparedNode],
+        interns: &Interns,
+        globals: &NameMap,
+        existing_functions: Vec<Function>,
+        options: CompileOptions,
+        registry: Option<&ModuleRegistry>,
+        globals_base: u16,
+        registered_tail: Option<u16>,
+    ) -> Result<CompileResult, CompileError> {
         let num_locals = check_namespace_size_u16(globals.len(), "module")?;
         // Module frames have `locals_count = 0` at runtime (globals live in
         // `self.globals`), so comp-var offsets are emitted as plain operand-
@@ -452,22 +495,39 @@ impl<'a> Compiler<'a> {
             true,
             0,
             options.assert_message_annotations.enabled(),
+            registry,
+            globals_base,
         );
 
-        // All globals are "local names" in the module
+        // All globals are "local names" in the module. The registered names
+        // are keyed by the runtime slot — base included — because that is the
+        // operand a `NameError` reports.
         for (slot, name_id) in globals.iter() {
-            compiler.code.register_local_name(slot.as_u16(), name_id);
+            let slot = compiler.global_slot(slot.as_u16(), CodeRange::default())?;
+            compiler.code.register_local_name(slot, name_id);
         }
 
         compiler.compile_block(nodes)?;
 
-        // Module returns None if no explicit return
-        compiler.code.emit(Opcode::LoadNone)?;
-        compiler.code.emit(Opcode::ReturnValue)?;
+        if let Some(index) = registered_tail {
+            // A registered module body ends by materializing its module
+            // object from the completed globals range; `ReturnValue` hands it
+            // to the import site. The prepare phase applied no
+            // last-expression transform, so control always reaches this tail.
+            compiler
+                .code
+                .emit_u16_u16(Opcode::RegisteredModule, REGISTERED_MODULE_MAKE, index)?;
+            compiler.code.emit(Opcode::ReturnValue)?;
+        } else {
+            // Module returns None if no explicit return
+            compiler.code.emit(Opcode::LoadNone)?;
+            compiler.code.emit(Opcode::ReturnValue)?;
+        }
 
         Ok(CompileResult {
             code: compiler.code.build(num_locals),
             functions: compiler.functions,
+            registered_imports: compiler.registered_imports,
         })
     }
 
@@ -485,18 +545,32 @@ impl<'a> Compiler<'a> {
         functions: Vec<Function>,
         num_locals: u16,
         assert_message_annotations: bool,
-    ) -> Result<(Code, Vec<Function>), CompileError> {
+        registry: Option<&ModuleRegistry>,
+        globals_base: u16,
+    ) -> Result<CompiledBody, CompileError> {
         // Function frames have `locals_count = num_locals` at runtime, so
         // comp-var load/store opcodes use `num_locals + offset` to skip past
         // the locals region into the operand-stack region.
-        let mut compiler = Compiler::new(interns, functions, false, num_locals, assert_message_annotations);
+        let mut compiler = Compiler::new(
+            interns,
+            functions,
+            false,
+            num_locals,
+            assert_message_annotations,
+            registry,
+            globals_base,
+        );
         compiler.compile_block(body)?;
 
         // Implicit return None if no explicit return
         compiler.code.emit(Opcode::LoadNone)?;
         compiler.code.emit(Opcode::ReturnValue)?;
 
-        Ok((compiler.code.build(num_locals), compiler.functions))
+        Ok(CompiledBody {
+            code: compiler.code.build(num_locals),
+            functions: compiler.functions,
+            registered_imports: compiler.registered_imports,
+        })
     }
 
     /// Compiles a block of statements.
@@ -743,6 +817,8 @@ impl<'a> Compiler<'a> {
     /// variables are captured, the pushed cells are consumed by `MakeClosure`.
     fn emit_make_function(&mut self, func_def: &PreparedFunctionDef, what: &'static str) -> Result<(), CompileError> {
         let assert_message_annotations = self.assert_message_annotations;
+        let registry = self.registry;
+        let globals_base = self.globals_base;
         self.emit_make_callable(func_def, what, |interns, functions, namespace_size| {
             Self::compile_function_body(
                 &func_def.body,
@@ -750,6 +826,8 @@ impl<'a> Compiler<'a> {
                 functions,
                 namespace_size,
                 assert_message_annotations,
+                registry,
+                globals_base,
             )
         })
     }
@@ -771,7 +849,7 @@ impl<'a> Compiler<'a> {
         &mut self,
         func_def: &PreparedFunctionDef,
         what: &'static str,
-        compile_body: impl FnOnce(&Interns, Vec<Function>, u16) -> Result<(Code, Vec<Function>), CompileError>,
+        compile_body: impl FnOnce(&Interns, Vec<Function>, u16) -> Result<CompiledBody, CompileError>,
     ) -> Result<(), CompileError> {
         let func_pos = func_def.name.position;
 
@@ -784,7 +862,14 @@ impl<'a> Compiler<'a> {
         // Take ownership of functions for the recursive compile, then restore.
         let functions = mem::take(&mut self.functions);
         let namespace_size = check_namespace_size_u16(func_def.namespace_size, what)?;
-        let (body_code, mut functions) = compile_body(self.interns, functions, namespace_size)?;
+        let CompiledBody {
+            code: body_code,
+            mut functions,
+            registered_imports,
+        } = compile_body(self.interns, functions, namespace_size)?;
+        // Dependency edges found inside the nested body belong to the
+        // enclosing module's compilation.
+        self.registered_imports.extend(registered_imports);
 
         // 2. Create the compiled Function and add to the vector
         let func_id = functions.len();
@@ -906,6 +991,8 @@ impl<'a> Compiler<'a> {
         position: CodeRange,
     ) -> Result<(), CompileError> {
         let assert_message_annotations = self.assert_message_annotations;
+        let registry = self.registry;
+        let globals_base = self.globals_base;
         self.emit_make_callable(body, "class body", |interns, functions, namespace_size| {
             Self::compile_class_body(
                 &body.body,
@@ -916,6 +1003,8 @@ impl<'a> Compiler<'a> {
                 functions,
                 namespace_size,
                 assert_message_annotations,
+                registry,
+                globals_base,
             )
         })
     }
@@ -942,8 +1031,18 @@ impl<'a> Compiler<'a> {
         functions: Vec<Function>,
         num_locals: u16,
         assert_message_annotations: bool,
-    ) -> Result<(Code, Vec<Function>), CompileError> {
-        let mut compiler = Compiler::new(interns, functions, false, num_locals, assert_message_annotations);
+        registry: Option<&ModuleRegistry>,
+        globals_base: u16,
+    ) -> Result<CompiledBody, CompileError> {
+        let mut compiler = Compiler::new(
+            interns,
+            functions,
+            false,
+            num_locals,
+            assert_message_annotations,
+            registry,
+            globals_base,
+        );
         compiler.compile_block(body)?;
 
         // Assembly errors (e.g. resource limits while building the dict)
@@ -970,7 +1069,11 @@ impl<'a> Compiler<'a> {
             .emit_call_builtin_function(BuiltinsFunctions::Type as u8, 3)?;
         compiler.code.emit(Opcode::ReturnValue)?;
 
-        Ok((compiler.code.build(num_locals), compiler.functions))
+        Ok(CompiledBody {
+            code: compiler.code.build(num_locals),
+            functions: compiler.functions,
+            registered_imports: compiler.registered_imports,
+        })
     }
 
     /// Compiles an import statement.
@@ -982,11 +1085,19 @@ impl<'a> Compiler<'a> {
         let position = binding.position;
         self.code.set_location(position, None);
 
-        // Look up the module by name
+        // Look up the module by name. Built-ins take precedence, so a
+        // registered module can never shadow one (registration refuses the
+        // collision anyway).
         if let Some(builtin_module) = StandardLib::from_string_id(module_name) {
             // Known module - emit LoadModule
             self.code.emit_u8(Opcode::LoadModule, builtin_module as u8)?;
             // Store to the binding (respects Local/Global/Cell scope)
+            self.compile_store(binding)?;
+        } else if let Some(index) = self.registry_index(module_name) {
+            // Registered source module: executed on first import, cached after.
+            self.registered_imports.push(index);
+            self.code
+                .emit_u16_u16(Opcode::RegisteredModule, REGISTERED_MODULE_IMPORT, index)?;
             self.compile_store(binding)?;
         } else {
             // Unknown module - defer error to runtime with RaiseImportError
@@ -995,6 +1106,11 @@ impl<'a> Compiler<'a> {
             self.code.emit_u16(Opcode::RaiseImportError, name_const)?;
         }
         Ok(())
+    }
+
+    /// Resolves an import name against the registered-module registry.
+    fn registry_index(&self, name: StringId) -> Option<u16> {
+        self.registry.and_then(|registry| registry.index_of(name))
     }
 
     /// Compiles a `from module import name, ...` statement.
@@ -1011,30 +1127,46 @@ impl<'a> Compiler<'a> {
     ) -> Result<(), CompileError> {
         self.code.set_location(position, None);
 
-        // Look up the module
+        // Look up the module. Built-ins take precedence, as in `compile_import`.
         if let Some(builtin_module) = StandardLib::from_string_id(module_name) {
             // Known module - emit LoadModule
             self.code.emit_u8(Opcode::LoadModule, builtin_module as u8)?;
-
-            // For each name to import
-            for (i, (import_name, binding)) in names.iter().enumerate() {
-                // Dup the module if this isn't the last import (last one consumes the module)
-                if i < names.len() - 1 {
-                    self.code.emit(Opcode::Dup)?;
-                }
-
-                // Load the attribute from the module (raises ImportError if not found)
-                let name_idx = check_name_index_u16(*import_name, position)?;
-                self.code.emit_u16(Opcode::LoadAttrImport, name_idx)?;
-
-                // Store to the binding
-                self.compile_store(binding)?;
-            }
+            self.compile_import_from_names(names, position)?;
+        } else if let Some(index) = self.registry_index(module_name) {
+            // Registered source module: the attribute loads work on the
+            // materialized module object exactly as they do on a built-in.
+            self.registered_imports.push(index);
+            self.code
+                .emit_u16_u16(Opcode::RegisteredModule, REGISTERED_MODULE_IMPORT, index)?;
+            self.compile_import_from_names(names, position)?;
         } else {
             // Unknown module - defer error to runtime with RaiseImportError
             // This allows TYPE_CHECKING imports to compile without error
             let name_const = self.code.add_const(Value::InternString(module_name))?;
             self.code.emit_u16(Opcode::RaiseImportError, name_const)?;
+        }
+        Ok(())
+    }
+
+    /// Emits the per-name attribute loads and stores of a `from m import a, b`
+    /// statement, consuming the module object on the stack.
+    fn compile_import_from_names(
+        &mut self,
+        names: &[(StringId, Identifier)],
+        position: CodeRange,
+    ) -> Result<(), CompileError> {
+        for (i, (import_name, binding)) in names.iter().enumerate() {
+            // Dup the module if this isn't the last import (last one consumes the module)
+            if i < names.len() - 1 {
+                self.code.emit(Opcode::Dup)?;
+            }
+
+            // Load the attribute from the module (raises ImportError if not found)
+            let name_idx = check_name_index_u16(*import_name, position)?;
+            self.code.emit_u16(Opcode::LoadAttrImport, name_idx)?;
+
+            // Store to the binding
+            self.compile_store(binding)?;
         }
         Ok(())
     }
@@ -1380,6 +1512,20 @@ impl<'a> Compiler<'a> {
     // Variable Operations
     // ========================================================================
 
+    /// Applies the enclosing module's globals base to a module-relative slot,
+    /// producing the runtime slot in the VM's flat globals vector.
+    ///
+    /// Construction bounds the total namespace (main program plus every
+    /// registered module) to the `u16` operand range, so this addition cannot
+    /// overflow for code that construction admitted; `checked_add` turns any
+    /// violation of that invariant into a compile error instead of a silently
+    /// wrong slot.
+    fn global_slot(&self, slot: u16, position: CodeRange) -> Result<u16, CompileError> {
+        self.globals_base
+            .checked_add(slot)
+            .ok_or_else(|| CompileError::new("total global namespace exceeds the bytecode slot limit", position))
+    }
+
     /// Compiles loading a variable onto the stack.
     ///
     /// At module level, `Local` scopes emits global opcodes
@@ -1388,16 +1534,21 @@ impl<'a> Compiler<'a> {
         let slot = ident.namespace_id().as_u16();
         match ident.scope {
             NameScope::Local => {
-                // True local - register name and mark as assigned for UnboundLocalError
-                self.code.register_local_name(slot, ident.name_id);
                 if self.is_module_scope {
+                    // Module-level "local": lives in the globals array, at
+                    // the enclosing module's base.
+                    let slot = self.global_slot(slot, ident.position)?;
+                    self.code.register_local_name(slot, ident.name_id);
                     self.code.emit_u16(Opcode::LoadGlobal, slot)
                 } else {
+                    // True local - register name and mark as assigned for UnboundLocalError
+                    self.code.register_local_name(slot, ident.name_id);
                     self.code.emit_load_local(slot)
                 }
             }
             NameScope::Global => {
                 // Global name - only a "local" name at module scope
+                let slot = self.global_slot(slot, ident.position)?;
                 if self.is_module_scope {
                     self.code.register_local_name(slot, ident.name_id);
                 }
@@ -1432,8 +1583,8 @@ impl<'a> Compiler<'a> {
                 // Global scope - name_id is encoded in the operand because global slot
                 // indices are in a different namespace from local slots, so looking up
                 // the name from the current frame's local_names would be incorrect
-                self.code
-                    .emit_load_global_callable(ident.namespace_id().as_u16(), ident.name_id)
+                let slot = self.global_slot(ident.namespace_id().as_u16(), ident.position)?;
+                self.code.emit_load_global_callable(slot, ident.name_id)
             }
             // Local, Cell, and CompVar can't be external functions - use regular load
             NameScope::Local | NameScope::Cell | NameScope::CompVar => self.compile_name(ident),
@@ -1452,16 +1603,17 @@ impl<'a> Compiler<'a> {
                 // `Local` is a genuine local that may freely shadow a dunder name.
                 if self.is_module_scope {
                     self.check_reserved_dunder_store(target)?;
-                }
-                self.code.register_local_name(slot, target.name_id);
-                if self.is_module_scope {
+                    let slot = self.global_slot(slot, target.position)?;
+                    self.code.register_local_name(slot, target.name_id);
                     self.code.emit_u16(Opcode::StoreGlobal, slot)
                 } else {
+                    self.code.register_local_name(slot, target.name_id);
                     self.code.emit_store_local(slot)
                 }
             }
             NameScope::Global => {
                 self.check_reserved_dunder_store(target)?;
+                let slot = self.global_slot(slot, target.position)?;
                 self.code.emit_u16(Opcode::StoreGlobal, slot)
             }
             NameScope::Cell => {
@@ -4005,6 +4157,7 @@ impl<'a> Compiler<'a> {
         match target.scope {
             NameScope::Local => {
                 if self.is_module_scope {
+                    let slot = self.global_slot(slot, target.position)?;
                     self.code.emit_u16(Opcode::DeleteGlobal, slot)?;
                 } else if let Ok(s) = u8::try_from(slot) {
                     self.code.emit_u8(Opcode::DeleteLocal, s)?;
@@ -4019,6 +4172,7 @@ impl<'a> Compiler<'a> {
                 }
             }
             NameScope::Global => {
+                let slot = self.global_slot(slot, target.position)?;
                 self.code.emit_u16(Opcode::DeleteGlobal, slot)?;
             }
             NameScope::Cell => {

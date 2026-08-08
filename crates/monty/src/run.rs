@@ -4,21 +4,26 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
-pub use monty_types::CompileOptions;
+pub use monty_types::{CompileOptions, SourceModule};
 use monty_types::{ExcType, MontyException, MontyObject, PrintWriter, ResourceTracker};
 use ruff_python_stdlib::identifiers::is_identifier;
 
 use crate::{
+    args::Signature,
     bytecode::{Code, Compiler, FrameExit, VM},
     dump_format::{DumpKind, dump, load},
     exception_private::{ExcTypeExt, RunResult},
+    expressions::Identifier,
+    function::Function,
     heap::{DropWithContext, Heap, HeapReader},
-    intern::{InternerBuilder, Interns},
+    intern::{FunctionId, InternerBuilder, Interns},
+    modules::StandardLib,
     name_map::NameMap,
     namespace::NamespaceId,
     object_bridge::MontyObjectExt,
-    parse::{CodeRange, parse, parse_with_interner},
-    prepare::{prepare, prepare_with_existing_names},
+    parse::{CodeRange, ParseResult, parse, parse_with_interner},
+    prepare::{prepare, prepare_module_body, prepare_with_existing_names},
+    registered::{ModuleRegistry, RegisteredModule},
     run_progress::{RunProgress, build_run_progress, check_snapshot_from_converted, convert_frame_exit},
     types::str::StringRepr,
     value::Value,
@@ -73,6 +78,35 @@ impl MontyRun {
         options: CompileOptions,
     ) -> Result<Self, MontyException> {
         Executor::new(code, script_name, input_names, options).map(|executor| Self { executor })
+    }
+
+    /// Creates a new run snapshot with embedder-registered source modules.
+    ///
+    /// Each [`SourceModule`] becomes importable by its `name` from the main
+    /// program and from other registered modules: `import networking` binds
+    /// the module object, `from networking import declare` binds its
+    /// attributes. A module body executes inside the sandbox on the first
+    /// import that reaches it — exactly once per run — and its traceback
+    /// frames carry the module's `file_name`. Modules see nothing of each
+    /// other implicitly (each has its own namespace); built-in module names
+    /// cannot be shadowed; and import cycles among registered modules are
+    /// refused here, at construction.
+    ///
+    /// Sources come from the embedder, never from a filesystem — registering
+    /// modules adds no I/O capability to sandboxed code.
+    ///
+    /// # Errors
+    /// Returns `MontyException` if any source cannot be parsed or compiled,
+    /// if a module name is invalid, duplicated, or collides with a built-in
+    /// module, or if the registered imports form a cycle.
+    pub fn new_with_modules(
+        code: String,
+        script_name: &str,
+        input_names: Vec<String>,
+        modules: Vec<SourceModule>,
+        options: CompileOptions,
+    ) -> Result<Self, MontyException> {
+        Executor::new_with_modules(code, script_name, input_names, modules, options).map(|executor| Self { executor })
     }
 
     /// Returns the code that was parsed to create this snapshot.
@@ -190,6 +224,7 @@ impl MontyRun {
                     print.reborrow(),
                     executor.assert_repr_max_bytes,
                 );
+                vm.set_registered(&executor.registered);
                 executor.populate_inputs(inputs, &mut vm)?;
 
                 // Start execution
@@ -229,6 +264,10 @@ pub(crate) struct Executor {
     /// UTF-8 byte cap for each operand repr in introspected assert messages.
     /// Stored with the compiled program and passed to every VM.
     pub(crate) assert_repr_max_bytes: u32,
+    /// Embedder-registered source modules in registry order: compiled bodies,
+    /// per-module name maps, slot bases, and sources for traceback previews.
+    /// Empty for programs registered without modules.
+    pub(crate) registered: Vec<RegisteredModule>,
     /// Estimated heap capacity for pre-allocation on subsequent runs.
     /// Uses AtomicUsize for thread-safety (required by PyO3's Sync bound).
     heap_capacity: AtomicUsize,
@@ -243,6 +282,7 @@ impl Clone for Executor {
             code: self.code.clone(),
             input_slots: self.input_slots.clone(),
             assert_repr_max_bytes: self.assert_repr_max_bytes,
+            registered: self.registered.clone(),
             heap_capacity: AtomicUsize::new(self.heap_capacity.load(Ordering::Relaxed)),
         }
     }
@@ -256,31 +296,216 @@ impl Executor {
         input_names: Vec<String>,
         options: CompileOptions,
     ) -> Result<Self, MontyException> {
+        Self::new_with_modules(code, script_name, input_names, Vec::new(), options)
+    }
+
+    /// Creates a new executor with embedder-registered source modules.
+    ///
+    /// The pipeline that gives each module its own namespace inside one flat
+    /// globals vector:
+    ///
+    /// 1. every file parses against one chained interner (string ids are
+    ///    program-unique; each file's positions carry its own file name);
+    /// 2. module names are validated (identifier, unique, not a built-in) and
+    ///    become the compile-time import registry;
+    /// 3. the main program prepares with the input names, each module body
+    ///    against a fresh empty namespace;
+    /// 4. each module is assigned a disjoint slot range after the main
+    ///    program's, and compiles with that base baked into every global-slot
+    ///    operand, ending in a `RegisteredModule` make tail;
+    /// 5. each compiled body is wrapped as a zero-arg `<module>` function so
+    ///    first import runs it through the ordinary call machinery (and
+    ///    suspended frames serialize like any other call);
+    /// 6. the dependency edges the compiler recorded are checked for cycles.
+    pub(crate) fn new_with_modules(
+        code: String,
+        script_name: &str,
+        input_names: Vec<String>,
+        modules: Vec<SourceModule>,
+        options: CompileOptions,
+    ) -> Result<Self, MontyException> {
         check_identifier(&input_names)?;
-        let parse_result = parse(&code, script_name).map_err(|e| e.into_python_exc(script_name, &code))?;
-        let prepared = prepare(parse_result, input_names).map_err(|e| e.into_python_exc(script_name, &code))?;
+
+        // 1. Parse every file against one chained interner.
+        let ParseResult {
+            nodes: main_nodes,
+            mut interner,
+        } = parse(&code, script_name).map_err(|e| e.into_python_exc(script_name, &code))?;
+        let mut parsed_modules = Vec::with_capacity(modules.len());
+        for module in &modules {
+            let ParseResult { nodes, interner: next } = parse_with_interner(&module.code, &module.file_name, interner)
+                .map_err(|e| e.into_python_exc(&module.file_name, &module.code))?;
+            parsed_modules.push(nodes);
+            interner = next;
+        }
+
+        // 2. Validate names and build the import registry. `u16` bounds the
+        // registry index operand.
+        if modules.len() > usize::from(u16::MAX) + 1 {
+            return Err(MontyException::new(
+                ExcType::SyntaxError,
+                Some(format!(
+                    "too many registered modules ({} > {})",
+                    modules.len(),
+                    usize::from(u16::MAX) + 1
+                )),
+            ));
+        }
+        let mut registry_names = Vec::with_capacity(modules.len());
+        for module in &modules {
+            if !is_identifier(&module.name) {
+                return Err(MontyException::new(
+                    ExcType::SyntaxError,
+                    Some(format!(
+                        "Module name {} not a valid identifier",
+                        StringRepr(&module.name)
+                    )),
+                ));
+            }
+            let name_id = interner.intern(&module.name);
+            if StandardLib::from_string_id(name_id).is_some() {
+                return Err(MontyException::new(
+                    ExcType::SyntaxError,
+                    Some(format!(
+                        "Module name {} collides with a built-in module",
+                        StringRepr(&module.name)
+                    )),
+                ));
+            }
+            if registry_names.contains(&name_id) {
+                return Err(MontyException::new(
+                    ExcType::SyntaxError,
+                    Some(format!("Module name {} registered twice", StringRepr(&module.name))),
+                ));
+            }
+            registry_names.push(name_id);
+        }
+        // Every module body wrapper carries the CPython module-frame name.
+        let module_frame_name = interner.intern("<module>");
+        let registry = ModuleRegistry::new(registry_names.clone());
+
+        // 3. Prepare: the main program with its input names, each module body
+        // against a fresh empty namespace (and no last-expression transform —
+        // bodies must fall through to their make tail).
+        let mut prepared_main = prepare(
+            ParseResult {
+                nodes: main_nodes,
+                interner,
+            },
+            input_names,
+        )
+        .map_err(|e| e.into_python_exc(script_name, &code))?;
+        let mut prepared_modules = Vec::with_capacity(modules.len());
+        for (module, nodes) in modules.iter().zip(parsed_modules) {
+            let prepared = prepare_module_body(ParseResult {
+                nodes,
+                interner: prepared_main.interner,
+            })
+            .map_err(|e| e.into_python_exc(&module.file_name, &module.code))?;
+            prepared_main.interner = prepared.interner;
+            prepared_modules.push((prepared.globals, prepared.nodes));
+        }
+
+        // 4. Disjoint slot ranges: main first (inputs keep slots 0..n), then
+        // each module after the previous. The compiler re-checks per-map
+        // sizes; this bounds the combined range the bases bake in.
+        let mut total_namespace = prepared_main.globals.len();
+        let mut bases = Vec::with_capacity(prepared_modules.len());
+        for (globals, _) in &prepared_modules {
+            bases.push(total_namespace);
+            total_namespace += globals.len();
+        }
+        if total_namespace > usize::from(u16::MAX) + 1 {
+            return Err(MontyException::new(
+                ExcType::SyntaxError,
+                Some(format!(
+                    "total global namespace across the program and its registered modules ({total_namespace} slots) exceeds the bytecode limit ({})",
+                    usize::from(u16::MAX) + 1
+                )),
+            ));
+        }
 
         // Create interns with empty functions (functions will be set after compilation)
-        let mut interns = Interns::new(prepared.interner, Vec::new());
+        let mut interns = Interns::new(prepared_main.interner, Vec::new());
 
-        // Compile the module to bytecode, which also compiles all nested functions.
-        // The compiler enforces the bytecode-format namespace-size limit and reports
-        // it as a `SyntaxError` rather than panicking on the `u16` cast.
-        let namespace_size = prepared.globals.len();
-        let compile_result = Compiler::compile_module(&prepared.nodes, &interns, &prepared.globals, options)
-            .map_err(|e| e.into_python_exc(script_name, &code))?;
+        // 5. Compile: main program at base 0 with the plain tail, then each
+        // module at its base with the make tail, accumulating one function
+        // table so every `FunctionId` stays program-unique.
+        let main_compile = Compiler::compile_module_core(
+            &prepared_main.nodes,
+            &interns,
+            &prepared_main.globals,
+            Vec::new(),
+            options,
+            Some(&registry),
+            0,
+            None,
+        )
+        .map_err(|e| e.into_python_exc(script_name, &code))?;
+        let mut functions = main_compile.functions;
+
+        let mut registered = Vec::with_capacity(modules.len());
+        let mut import_edges = Vec::with_capacity(modules.len());
+        for (index, (module, (globals, nodes))) in modules.into_iter().zip(prepared_modules).enumerate() {
+            let base = u16::try_from(bases[index]).expect("bounded by the total-namespace check above");
+            let tail = u16::try_from(index).expect("bounded by the registry-size check above");
+            let compile = Compiler::compile_module_core(
+                &nodes,
+                &interns,
+                &globals,
+                functions,
+                options,
+                Some(&registry),
+                base,
+                Some(tail),
+            )
+            .map_err(|e| e.into_python_exc(&module.file_name, &module.code))?;
+            functions = compile.functions;
+            import_edges.push(compile.registered_imports);
+
+            let function_index = u16::try_from(functions.len()).map_err(|_| {
+                MontyException::new(
+                    ExcType::SyntaxError,
+                    Some("too many functions across the program and its registered modules".to_string()),
+                )
+            })?;
+            functions.push(Function::new(
+                Identifier::new(module_frame_name, CodeRange::default()),
+                Signature::default(),
+                0,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                0,
+                false,
+                compile.code,
+            ));
+            registered.push(RegisteredModule {
+                name_id: registry_names[index],
+                file_name: module.file_name,
+                source: module.code,
+                name_map: globals,
+                globals_base: base,
+                function_id: FunctionId::from_index(function_index),
+            });
+        }
+
+        // 6. Refuse import cycles among registered modules, by name.
+        refuse_import_cycles(&import_edges, &registered, &interns)?;
 
         // Set the compiled functions in the interns
-        interns.set_functions(compile_result.functions);
+        interns.set_functions(functions);
 
         Ok(Self {
-            globals: prepared.globals,
-            module_code: Arc::new(compile_result.code),
+            globals: prepared_main.globals,
+            module_code: Arc::new(main_compile.code),
             interns,
             code,
             input_slots: Vec::new(),
             assert_repr_max_bytes: options.assert_message_annotations.max_bytes(),
-            heap_capacity: AtomicUsize::new(namespace_size),
+            registered,
+            heap_capacity: AtomicUsize::new(total_namespace),
         })
     }
 
@@ -288,6 +513,15 @@ impl Executor {
     #[inline]
     pub(crate) fn namespace_size(&self) -> usize {
         self.globals.len()
+    }
+
+    /// Returns the combined globals-vector size: the main program's namespace
+    /// plus every registered module's disjoint slot range.
+    #[inline]
+    pub(crate) fn total_namespace_size(&self) -> usize {
+        self.registered.last().map_or(self.namespace_size(), |module| {
+            usize::from(module.globals_base) + module.name_map.len()
+        })
     }
 
     /// Compiles one REPL snippet against existing session metadata.
@@ -353,6 +587,7 @@ impl Executor {
             code,
             input_slots,
             assert_repr_max_bytes: options.assert_message_annotations.max_bytes(),
+            registered: Vec::new(),
             heap_capacity: AtomicUsize::new(0),
         })
     }
@@ -386,6 +621,7 @@ impl Executor {
                 print.reborrow(),
                 executor.assert_repr_max_bytes,
             );
+            vm.set_registered(&executor.registered);
             executor.populate_inputs(inputs, &mut vm)?;
             executor.run_to_completion(&mut vm)
         });
@@ -396,7 +632,7 @@ impl Executor {
 
         // Non-REPL execution has exactly one source, so every frame's filename
         // resolves to the same `self.code`.
-        result.map_err(|e| e.into_python_exception(&self.interns, |_| Some(self.code.as_str())))
+        result.map_err(|e| e.into_python_exception(&self.interns, |filename| self.source_for(filename)))
     }
 
     /// Runs module code on an already-configured VM to completion.
@@ -479,6 +715,7 @@ impl Executor {
                 PrintWriter::Stdout,
                 executor.assert_repr_max_bytes,
             );
+            vm.set_registered(&executor.registered);
             executor.populate_inputs(inputs, &mut vm)?;
             let frame_exit_result = vm.run_module(&executor.module_code);
 
@@ -520,7 +757,7 @@ impl Executor {
             // Convert return value while VM is still alive (needs access to interns).
             // Non-REPL: single source, so every frame resolves to `executor.code`.
             let py_object = frame_exit_to_object(frame_exit_result, &mut vm)
-                .map_err(|e| e.into_python_exception(&executor.interns, |_| Some(executor.code.as_str())))?;
+                .map_err(|e| e.into_python_exception(&executor.interns, |filename| executor.source_for(filename)))?;
 
             // Drop globals with proper ref counting
             globals.drop_with(vm.heap);
@@ -543,7 +780,19 @@ impl Executor {
     /// with these empty globals, then [`populate_inputs`](Self::populate_inputs) fills
     /// the input slots while the VM is alive.
     pub(crate) fn empty_globals(&self) -> Vec<Value> {
-        (0..self.namespace_size()).map(|_| Value::Undefined).collect()
+        // The one flat vector spans the main program's namespace and every
+        // registered module's disjoint slot range.
+        (0..self.total_namespace_size()).map(|_| Value::Undefined).collect()
+    }
+
+    /// Serves the source text for a traceback frame's file name: a registered
+    /// module's source for its file, the main program's for everything else.
+    pub(crate) fn source_for(&self, filename: &str) -> Option<&str> {
+        self.registered
+            .iter()
+            .find(|module| module.file_name == filename)
+            .map(|module| module.source.as_str())
+            .or(Some(self.code.as_str()))
     }
 
     /// Converts `MontyObject` inputs to `Value`s and writes them into the VM's globals.
@@ -640,6 +889,72 @@ fn check_identifier(input_names: &[String]) -> Result<(), MontyException> {
             return Err(MontyException::new(
                 ExcType::SyntaxError,
                 Some(format!("Input name {} not a valid identifier", StringRepr(name))),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Refuses import cycles among registered modules, naming the cycle path.
+///
+/// `edges[i]` lists the registry indexes module `i` imports anywhere in its
+/// body (function and class bodies included) — recorded by the compiler while
+/// it resolved the imports. The main program cannot participate in a cycle
+/// because it is not importable, so only module-to-module edges are walked.
+/// With the graph acyclic, first-import execution recurses cleanly:
+/// importing a module first executes its own imports, depth-first.
+fn refuse_import_cycles(
+    edges: &[Vec<u16>],
+    registered: &[RegisteredModule],
+    interns: &Interns,
+) -> Result<(), MontyException> {
+    const UNVISITED: u8 = 0;
+    const IN_STACK: u8 = 1;
+    const DONE: u8 = 2;
+
+    fn visit(node: usize, edges: &[Vec<u16>], marks: &mut [u8], stack: &mut Vec<usize>) -> Option<Vec<usize>> {
+        marks[node] = IN_STACK;
+        stack.push(node);
+        for &next in &edges[node] {
+            let next = usize::from(next);
+            match marks[next] {
+                IN_STACK => {
+                    // The cycle is the stack from `next`'s frame down, closed
+                    // back onto `next`.
+                    let start = stack
+                        .iter()
+                        .position(|&n| n == next)
+                        .expect("in-stack node is on the stack");
+                    let mut cycle = stack[start..].to_vec();
+                    cycle.push(next);
+                    return Some(cycle);
+                }
+                UNVISITED => {
+                    if let Some(cycle) = visit(next, edges, marks, stack) {
+                        return Some(cycle);
+                    }
+                }
+                _ => {}
+            }
+        }
+        stack.pop();
+        marks[node] = DONE;
+        None
+    }
+
+    let mut marks = vec![UNVISITED; edges.len()];
+    let mut stack = Vec::new();
+    for node in 0..edges.len() {
+        if marks[node] == UNVISITED
+            && let Some(cycle) = visit(node, edges, &mut marks, &mut stack)
+        {
+            let path: Vec<&str> = cycle
+                .iter()
+                .map(|&index| interns.get_str(registered[index].name_id))
+                .collect();
+            return Err(MontyException::new(
+                ExcType::ImportError,
+                Some(format!("import cycle among registered modules: {}", path.join(" -> "))),
             ));
         }
     }

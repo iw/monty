@@ -71,3 +71,24 @@ impl From<bool> for AssertMessageAnnotations {
         if enabled { Self::default() } else { Self::Off }
     }
 }
+
+/// One embedder-supplied Python source module, importable by name from the
+/// main program and from other registered modules.
+///
+/// Registered with `MontyRun::new_with_modules` (in the `monty` crate),
+/// compiled together with the main program, and executed inside the same
+/// sandbox on first import — exactly once per run. The source comes from the
+/// embedder, never from a filesystem: registering modules adds no I/O
+/// capability to sandboxed code.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SourceModule {
+    /// The importable name (`import <name>`). Must be a valid Python
+    /// identifier, unique across the registry, and must not collide with a
+    /// built-in module name.
+    pub name: String,
+    /// The file name shown in tracebacks and error previews for frames
+    /// executing this module's code (e.g. `"networking.py"`).
+    pub file_name: String,
+    /// The module's Python source.
+    pub code: String,
+}

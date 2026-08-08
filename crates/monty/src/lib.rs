@@ -24,6 +24,7 @@ mod object_bridge;
 mod os_dispatch;
 mod parse;
 mod prepare;
+mod registered;
 mod repl;
 mod resource_checks;
 mod run;

@@ -31,5 +31,5 @@ pub use crate::{
     },
     resource::{DEFAULT_MAX_RECURSION_DEPTH, LARGE_RESULT_THRESHOLD, ResourceError, ResourceLimits, ResourceTracker},
     results::{ExtFunctionResult, NameLookupResult},
-    run_options::{AssertMessageAnnotations, CompileOptions},
+    run_options::{AssertMessageAnnotations, CompileOptions, SourceModule},
 };

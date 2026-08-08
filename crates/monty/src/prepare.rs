@@ -108,6 +108,24 @@ pub(crate) fn prepare_with_existing_names(
     })
 }
 
+/// Prepares a registered module's body against a fresh, empty namespace.
+///
+/// Unlike [`prepare_with_existing_names`] this applies no last-expression
+/// return transform: a registered module body must fall through to its
+/// compiler-emitted tail (which materializes the module object), so a
+/// trailing expression statement — a docstring, say — must not become an
+/// early `return`.
+pub(crate) fn prepare_module_body(parse_result: ParseResult) -> Result<PrepareResult, ParseError> {
+    let ParseResult { nodes, interner } = parse_result;
+    let mut globals = NameMap::new();
+    let prepared_nodes = Prepare::new_module(&mut globals, &interner).prepare_nodes(nodes)?;
+    Ok(PrepareResult {
+        globals,
+        nodes: prepared_nodes,
+        interner,
+    })
+}
+
 /// Builds the module's initial `NameMap` from the embedder-supplied `input_names`.
 ///
 /// Input names are interned and added in order so they own the first
