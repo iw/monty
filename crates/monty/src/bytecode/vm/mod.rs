@@ -2317,11 +2317,27 @@ impl<'h> VM<'h> {
 
     /// Returns the interned name of a module-level global at `slot`, if known.
     ///
+    /// Slots in the main program's range resolve through the module code's
+    /// name table; slots in a registered module's range resolve through that
+    /// module's own name map. Without the second step, builtins — which
+    /// resolve by name on the undefined-global path — would be unreachable
+    /// from registered-module code.
+    ///
     /// Returns `None` if no module code is attached (test harness use of
-    /// `VM::new` without `run_module`) or if the slot is past the recorded
-    /// name table.
+    /// `VM::new` without `run_module`) or if the slot is past every recorded
+    /// range.
     fn global_name(&self, slot: u16) -> Option<StringId> {
-        self.module_code.and_then(|c| c.local_name(slot))
+        if let Some(name) = self.module_code.and_then(|c| c.local_name(slot)) {
+            return Some(name);
+        }
+        self.registered.iter().find_map(|module| {
+            let local = slot.checked_sub(module.globals_base)?;
+            module
+                .name_map
+                .iter()
+                .find(|(map_slot, _)| map_slot.as_u16() == local)
+                .map(|(_, name_id)| name_id)
+        })
     }
 
     /// Pops the top of stack and stores it in a global variable.

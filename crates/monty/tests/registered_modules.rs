@@ -362,3 +362,13 @@ fn module_attributes_refuse_assignment() {
     .unwrap_err();
     assert_eq!(err.exc_type(), ExcType::AttributeError);
 }
+
+// Builtins resolve by name on the undefined-global path, so a plain
+// (non-call) builtin reference inside module code exercises the
+// per-module-range name resolution.
+#[test]
+fn builtins_resolve_inside_module_code() {
+    let m = module("m", "def size(items):\n    f = len\n    return f(items)\n");
+    let result = run_with_modules("import m\nm.size([1, 2, 3])", vec![m]);
+    assert_eq!(result, MontyObject::Int(3));
+}
