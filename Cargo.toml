@@ -118,7 +118,8 @@ ahash = { version = "0.8.0", features = ["serde"] }
 indexmap = "2"
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
-postcard = { version = "1.1", features = ["alloc"] }
+# Snapshots use allocated buffers; omit the unused heapless default features.
+postcard = { version = "1.1", default-features = false, features = ["alloc"] }
 # exact pin: prost-build output must be byte-stable across contributors and CI
 # so `make check-proto` (regenerate + git diff) is reproducible
 prost = "=0.14.4"
